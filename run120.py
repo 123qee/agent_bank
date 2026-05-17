@@ -252,16 +252,12 @@ def llm_classify_intent(text: str) -> Optional[str]:
             question=text,
         )
         return None
-    system = (
-        "你是养老规划Agent的意图分类器。给定一个客户经理的问题，从下表中选择最匹配的"
-        "意图标签。只允许返回标签字符串本身，不要任何解释或标点。\n"
-        "可选标签：" + ", ".join(INTENT_LABELS)
-    )
-    prompt = f"问题：{text}\n输出：仅一个标签"
+    system = "养老Agent意图标签，只输出一个词，无任何其它字符：" + ",".join(INTENT_LABELS)
+    prompt = text
     res = llm_chat(
         prompt,
         system_prompt=system,
-        max_tokens=8,
+        max_tokens=16,
         timeout=8,
         purpose="规则路由未命中时，用大模型兜底判断问题意图",
         call_site="llm_classify_intent",
@@ -309,6 +305,10 @@ def fmt_int(value: float) -> str:
 
 def fmt_money(value: float) -> str:
     return f"{rnd(value)} 元"
+
+
+def fmt_short_money(value: float) -> str:
+    return f"{rnd(value)}元"
 
 
 def fmt_duration(text: str) -> str:
@@ -564,6 +564,38 @@ def scenario_context(user_id: str, text: str) -> Dict[str, Any]:
     return base
 
 
+INTENT_SUMMARY = {
+    "field": "基本信息",
+    "behavior_top": "产品偏好",
+    "buy_predict": "未来购买倾向",
+    "longevity": "长寿风险",
+    "retire_in": "退休时间",
+    "future_expend": "退休时月支出",
+    "living_need": "退休后总需求",
+    "min_reserve": "养老资金缺口",
+    "pension_pv": "养老金现值",
+    "future_acc": "退休时可积累资产",
+    "feasibility": "养老目标可行性",
+    "max_return": "收益最大化配置",
+    "low_vol": "最小化风险波动配置",
+}
+
+
+def _remember_discussed_intent(user_id: str, intent: str) -> None:
+    if intent == "report":
+        return
+    label = INTENT_SUMMARY.get(intent)
+    if not label:
+        return
+    with _session_lock:
+        memory = _session_memory.setdefault(user_id, {})
+        items = list(memory.get("last_discussed_intents") or [])
+        if label in items:
+            items.remove(label)
+        items.append(label)
+        memory["last_discussed_intents"] = items[-6:]
+
+
 def ctx_life(ctx: Dict[str, Any]) -> int:
     return int(ctx.get("life_expectancy", DEFAULT_LIFE_EXPECTANCY))
 
@@ -706,7 +738,8 @@ def min_risk_allocation(user: Dict[str, Any], ctx: Optional[Dict[str, Any]] = No
             continue
         acc = future_accumulation(user, PRODUCTS[product]["return"])
         if acc >= gap:
-            candidates.append((PRODUCTS[product]["risk"], PRODUCTS[product]["return"], product, acc))
+            # 在满足缺口的合规产品中，取收益率最低的一档（与题面“最低收益率可达标”一致）
+            candidates.append((PRODUCTS[product]["return"], PRODUCTS[product]["risk"], product, acc))
     if not candidates:
         return "当前风险承受范围内仅靠现有结余较难覆盖养老缺口，建议提高每月结余或适当提升风险承受能力"
     candidates.sort(key=lambda x: (x[0], x[1]))
@@ -836,7 +869,10 @@ def direct_field_answer(text: str, user: Dict[str, Any]) -> Optional[str]:
         value = money(user.get("Enterprise_Ann"))
         return "无" if value <= 0 else f"{fmt_int(value)}元"
     if ("退休金" in text or "养老金" in text) and not any(
-        word in text for word in ("缺口", "最低", "现值", "需要", "规划", "建议书")
+        word in text for word in (
+            "缺口", "最低", "现值", "需要", "规划", "建议书", "积攒", "积累",
+            "配置", "测算", "计算", "达成", "支撑", "覆盖", "退休时",
+        )
     ):
         return f"{fmt_int(money(user.get('Pension')))}元"
     return None
@@ -861,6 +897,7 @@ def _build_report_facts(
         ctx.get("later_inflation"),
     )
     pref_product, pref_cnt = top_behavior_product(user_id)
+    stated_product_preference = bool(ctx.get("product_preference"))
     if ctx.get("product_preference"):
         pref_product = str(ctx["product_preference"])
         pref_cnt = 0
@@ -902,6 +939,8 @@ def _build_report_facts(
         "allocation_mode": allocation_mode,
         "retirement_goal": ctx.get("retirement_goal", "maintain_consumption"),
         "risk_preference": ctx.get("risk_preference", ""),
+        "stated_product_preference": stated_product_preference,
+        "last_discussed_intents": list(ctx.get("last_discussed_intents") or []),
     }
 
 
@@ -912,10 +951,26 @@ def _report_template(f: Dict[str, Any]) -> str:
     pref_product = fmt_product_name(f["pref_product"])
     main_product = fmt_product_name(detail["main_product"])
     years_to_retire = fmt_duration(f["years_to_retire"])
+    discussed = "、".join(f.get("last_discussed_intents") or [])
     pref_source = (
-        f"根据客户的浏览与购买记录（共 {f['pref_count']} 次{pref_product}相关行为）"
-        if f["pref_count"]
-        else "根据前序沟通信息"
+        "根据前序沟通中客户表达的产品偏好"
+        if f.get("stated_product_preference")
+        else (
+            f"根据客户的浏览与购买记录（共 {f['pref_count']} 次{pref_product}相关行为）"
+            if f["pref_count"]
+            else "根据前序沟通信息"
+        )
+    )
+    if f.get("risk_preference") == "aggressive" or f["allocation_mode"] == "max_return":
+        preference_desc = "同时客户更关注长期投资收益，可在风险评级允许范围内提升收益弹性。"
+    elif f.get("risk_preference") == "low_risk" or f["allocation_mode"] == "low_vol":
+        preference_desc = "同时客户更关注稳健、流动性与风险波动控制。"
+    else:
+        preference_desc = "注重流动性与安全性。"
+    discussion_advice_line = (
+        f"   - 前序沟通已覆盖{discussed}等议题，建议后续围绕客户目标持续复盘；\n"
+        if discussed
+        else ""
     )
     if f["allocation_mode"] == "max_return":
         allocation_title = "客户偏好收益最大化方案："
@@ -961,12 +1016,13 @@ def _report_template(f: Dict[str, Any]) -> str:
         f"退休后预计总需求 {fmt_money(f['total_need'])}，其中养老金（先付年金现值）"
         f"可支撑 {fmt_money(f['pension_pv'])}，还有 {fmt_money(f['gap'])}缺口需要通过投资积累来覆盖。\n"
         "5. 产品偏好\n"
-        f"{pref_source}，推测客户偏好{pref_product}类产品，注重流动性与安全性。\n"
+        f"{pref_source}，推测客户偏好{pref_product}类产品，{preference_desc}\n"
         "6. 资产配置方式与具体方案\n"
         f"{allocation_title}"
         f"{allocation_lines}"
         f"{cash_line}{annuity_line}\n"
         "7. 其他建议\n"
+        f"{discussion_advice_line}"
         f"   - 客户目前 {f['age']} 岁，距退休长达 {years_to_retire}，复利效应显著，建议尽早开始投资积累；\n"
         f"   - 在沟通中了解客户对{pref_product}偏好的原因，视情况适当增减{pref_product}的配置比例；\n"
         "   - 随着客户投资能力与经验积累，若风险评级提升，还可增加权益类产品的配置以获取更高的长期收益。"
@@ -1128,7 +1184,7 @@ def _is_report_question(text: str) -> bool:
 
 
 def _is_feasibility_question(text: str) -> bool:
-    keywords_yes = ("能否", "能不能", "能达成", "是否能", "可否")
+    keywords_yes = ("能否", "能不能", "能达成", "是否能", "可否", "是否可以", "能实现", "能完成")
     if any(k in text for k in keywords_yes):
         return True
     return "不能" in text and "调整" in text
@@ -1138,15 +1194,21 @@ def _is_retire_in_question(text: str) -> bool:
     if "距离退休" in text:
         return True
     return "退休" in text and (
-        "还有多久" in text or "还要多久" in text or "什么时候" in text or "退休年龄" in text
+        "还有多久" in text or "还要多久" in text or "什么时候" in text
+        or "退休年龄" in text or "多久后" in text or "几年后" in text
     )
 
 
 def _is_future_expend_question(text: str) -> bool:
-    if "刚退休" in text:
+    if any(k in text for k in ("刚退休", "退休当月", "退休那个月", "退休的时候")) and not any(
+        k in text for k in ("最低", "至少", "缺口", "积攒", "储备", "准备")
+    ):
         return True
     if ("退休时" in text or "退休后" in text) and ("最低" not in text):
-        return any(k in text for k in ("每月", "月支出", "月花销", "月花费", "月消费", "支出多少", "花多少钱", "消费多少"))
+        return any(k in text for k in (
+            "每月", "月支出", "月花销", "月花费", "月消费", "月开销",
+            "支出多少", "花多少钱", "消费多少", "每个月",
+        ))
     return False
 
 
@@ -1155,16 +1217,23 @@ def _is_living_need_question(text: str) -> bool:
         return False
     return (
         "退休后" in text
-        and any(k in text for k in ("总需求", "总支出", "总花销", "总花费", "总消费", "生活费", "财富需求", "资金需求"))
+        and any(k in text for k in (
+            "总需求", "总支出", "总花销", "总花费", "总消费", "生活费",
+            "财富需求", "资金需求", "一共要花", "总开支", "总费用",
+        ))
     )
 
 
 def _is_min_reserve_question(text: str) -> bool:
+    if any(k in text for k in ("哪些", "什么问题", "沟通重点", "关注点")) and not any(
+        k in text for k in ("多少钱", "多少元", "金额", "缺口", "差额", "还差")
+    ):
+        return False
     if "现值" in text and ("养老金" in text or "退休金" in text):
         return False
-    if any(k in text for k in ("缺口", "还差", "差额", "资金缺口", "养老缺口")):
+    if any(k in text for k in ("缺口", "还差", "差额", "资金缺口", "养老缺口", "差多少钱", "还需要多少钱")):
         return True
-    if any(k in text for k in ("本金", "本钱", "养老资金", "养老储备", "养老本金")):
+    if any(k in text for k in ("本金", "本钱", "养老资金", "养老储备", "养老本金", "养老准备金")):
         return True
     return (
         any(k in text for k in ("最低", "至少", "最少", "需要", "应该", "要"))
@@ -1177,7 +1246,8 @@ def _is_accumulate_question(text: str) -> bool:
     return any(k in text for k in (
         "可以积攒", "能积攒", "积攒下", "可积累", "能积累", "可以积累",
         "退休时资产", "退休时能有", "退休时有多少钱", "退休时能攒", "退休时能存",
-        "预计积累", "预计攒下", "可以攒下", "能够积累",
+        "预计积累", "预计攒下", "可以攒下", "能够积累", "退休时手里有",
+        "退休时账户有", "退休时资产有", "退休时可攒", "退休时可存",
     ))
 
 
@@ -1188,9 +1258,9 @@ def _is_top_behavior_question(text: str) -> bool:
 
 
 def _is_buy_predict_question(text: str) -> bool:
-    if any(k in text for k in ("可能购买", "购买预测", "预测购买", "最可能买")):
+    if any(k in text for k in ("可能购买", "购买预测", "预测购买", "最可能买", "可能买", "会买什么")):
         return True
-    return ("未来" in text or "接下来" in text or "一个星期" in text) and (
+    return ("未来" in text or "接下来" in text or "一个星期" in text or "下周" in text or "下个月" in text) and (
         "购买" in text or "买" in text
     )
 
@@ -1266,7 +1336,9 @@ def _answer_by_intent(
     if intent == "retire_in":
         return years_months_text(retirement_months(user))
     if intent == "future_expend":
-        return f"{fmt_int(future_monthly_expend(user, ctx_inflation(ctx), ctx.get('split_after_years'), ctx.get('later_inflation')))}元"
+        return fmt_short_money(
+            future_monthly_expend(user, ctx_inflation(ctx), ctx.get("split_after_years"), ctx.get("later_inflation"))
+        )
     if intent == "living_need":
         need = retirement_need(
             user,
@@ -1276,7 +1348,7 @@ def _answer_by_intent(
             ctx.get("split_after_years"),
             ctx.get("later_inflation"),
         )
-        return f"{fmt_int(need['living_need'])}元"
+        return fmt_short_money(need["living_need"])
     if intent == "min_reserve":
         need = retirement_need(
             user,
@@ -1286,7 +1358,7 @@ def _answer_by_intent(
             ctx.get("split_after_years"),
             ctx.get("later_inflation"),
         )
-        return f"{fmt_int(need['gap'])}元"
+        return fmt_short_money(need["gap"])
     if intent == "pension_pv":
         need = retirement_need(
             user,
@@ -1296,9 +1368,9 @@ def _answer_by_intent(
             ctx.get("split_after_years"),
             ctx.get("later_inflation"),
         )
-        return f"{fmt_int(need['pension_pv'])}元"
+        return fmt_short_money(need["pension_pv"])
     if intent == "future_acc":
-        return f"{fmt_int(future_accumulation(user, ctx_return(ctx)))}元"
+        return fmt_short_money(future_accumulation(user, ctx_return(ctx)))
     if intent == "feasibility":
         need = rnd(
             retirement_need(
@@ -1328,6 +1400,7 @@ def answer_user_question(text: str, user_id: str, user: Dict[str, Any]) -> str:
         return "已记录客户观点"
     direct = direct_field_answer(text, user)
     if direct is not None:
+        _remember_discussed_intent(user_id, "field")
         debug_log("answer", user_id=user_id, intent="field", answer=direct)
         return direct
 
@@ -1335,6 +1408,7 @@ def answer_user_question(text: str, user_id: str, user: Dict[str, Any]) -> str:
     if intent:
         ans = _answer_by_intent(intent, text, user_id, user, ctx)
         if ans is not None:
+            _remember_discussed_intent(user_id, intent)
             debug_log("answer", user_id=user_id, intent=intent, answer=ans)
             return ans
 
@@ -1343,6 +1417,7 @@ def answer_user_question(text: str, user_id: str, user: Dict[str, Any]) -> str:
     if llm_intent:
         ans = _answer_by_intent(llm_intent, text, user_id, user, ctx)
         if ans is not None:
+            _remember_discussed_intent(user_id, llm_intent)
             debug_log("answer", user_id=user_id, intent=f"llm:{llm_intent}", answer=ans)
             return ans
 
