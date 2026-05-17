@@ -29,6 +29,7 @@ LLM_REPORT_POLISH = os.getenv("ONE_API_REPORT_POLISH", "0").lower() in ("1", "tr
 LLM_FALLBACK = os.getenv("ONE_API_FALLBACK", "1").lower() in ("1", "true", "yes")
 DEBUG_LOG_ENABLED = os.getenv("TASK2_DEBUG_LOG", "0").lower() in ("1", "true", "yes")
 DEBUG_LOG_DIR = os.getenv("TASK2_DEBUG_LOG_DIR", "/tmp/task2_agent_logs")
+DEBUG_CTX_SNAPSHOT = os.getenv("TASK2_DEBUG_CTX", "0").lower() in ("1", "true", "yes")
 _DEBUG_LOG_PATH: Optional[str] = None
 
 CURRENT_YEAR = 2025
@@ -57,6 +58,33 @@ _local = threading.local()
 _session_lock = threading.Lock()
 _session_memory: Dict[str, Dict[str, Any]] = {}
 _last_user_id: Optional[str] = None
+
+
+def reset_agent_session_state() -> None:
+    """本地批量测试：清空多轮会话；线上评测通常为独立进程，无需调用。"""
+    global _session_memory, _last_user_id
+    with _session_lock:
+        _session_memory.clear()
+        _last_user_id = None
+
+
+def _trace_ctx_snapshot(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    keys = (
+        "life_expectancy", "inflation", "investment_return",
+        "split_after_years", "later_inflation", "allocation_mode",
+        "product_preference", "retirement_goal", "risk_preference",
+        "last_discussed_intents",
+    )
+    snap: Dict[str, Any] = {}
+    for k in keys:
+        if k not in ctx:
+            continue
+        v = ctx[k]
+        if k == "last_discussed_intents" and isinstance(v, list):
+            snap[k] = list(v)[-8:]
+        else:
+            snap[k] = v
+    return snap
 
 
 def debug_log(event: str, **fields: Any) -> None:
@@ -1395,13 +1423,27 @@ def _answer_by_intent(
 
 def answer_user_question(text: str, user_id: str, user: Dict[str, Any]) -> str:
     ctx = scenario_context(user_id, text)
+    if DEBUG_LOG_ENABLED and DEBUG_CTX_SNAPSHOT:
+        debug_log("ctx_snapshot", user_id=user_id, ctx=_trace_ctx_snapshot(ctx))
     if _is_context_update_only(text, current_overrides(text)):
-        debug_log("answer", user_id=user_id, intent="context_update", answer="已记录客户观点")
+        debug_log(
+            "answer",
+            route_channel="context_update",
+            user_id=user_id,
+            intent="context_update",
+            answer="已记录客户观点",
+        )
         return "已记录客户观点"
     direct = direct_field_answer(text, user)
     if direct is not None:
         _remember_discussed_intent(user_id, "field")
-        debug_log("answer", user_id=user_id, intent="field", answer=direct)
+        debug_log(
+            "answer",
+            route_channel="direct_field",
+            user_id=user_id,
+            intent="field",
+            answer=direct,
+        )
         return direct
 
     intent = _route_intent(text)
@@ -1409,7 +1451,14 @@ def answer_user_question(text: str, user_id: str, user: Dict[str, Any]) -> str:
         ans = _answer_by_intent(intent, text, user_id, user, ctx)
         if ans is not None:
             _remember_discussed_intent(user_id, intent)
-            debug_log("answer", user_id=user_id, intent=intent, answer=ans)
+            debug_log(
+                "answer",
+                route_channel="rule_router",
+                user_id=user_id,
+                intent=intent,
+                answer=ans[:800] if isinstance(ans, str) and len(ans) > 800 else ans,
+                answer_truncated=isinstance(ans, str) and len(ans) > 800,
+            )
             return ans
 
     # 规则没匹配上，尝试让大模型理解自然语言变体；大模型只做意图分类，答案仍由代码确定性计算。
@@ -1418,12 +1467,27 @@ def answer_user_question(text: str, user_id: str, user: Dict[str, Any]) -> str:
         ans = _answer_by_intent(llm_intent, text, user_id, user, ctx)
         if ans is not None:
             _remember_discussed_intent(user_id, llm_intent)
-            debug_log("answer", user_id=user_id, intent=f"llm:{llm_intent}", answer=ans)
+            debug_log(
+                "answer",
+                route_channel="llm_classify",
+                user_id=user_id,
+                intent=f"llm:{llm_intent}",
+                llm_intent=llm_intent,
+                answer=ans[:800] if isinstance(ans, str) and len(ans) > 800 else ans,
+                answer_truncated=isinstance(ans, str) and len(ans) > 800,
+            )
             return ans
 
     # 最后兜底：不让大模型自由短答，直接生成结构化建议书
     ans = recommendation_report(user_id, user, text, ctx)
-    debug_log("answer", user_id=user_id, intent="fallback_report", answer=ans[:200])
+    debug_log(
+        "answer",
+        route_channel="fallback_report",
+        user_id=user_id,
+        intent="fallback_report",
+        answer_preview=_log_preview(ans, 320),
+        answer_chars=len(ans or ""),
+    )
     return ans
 
 
@@ -1467,20 +1531,39 @@ def run(inf: str) -> str:
     text = (inf or "").strip()
     if not text:
         return ""
+    started = time.time()
     try:
-        debug_log("question", question=text)
+        debug_log("question", question=text, question_chars=len(text))
         pop = _try_population_question(text)
         if pop is not None:
-            debug_log("answer", user_id=None, intent="population", answer=pop)
+            debug_log(
+                "answer",
+                route_channel="population_sql",
+                user_id=None,
+                intent="population",
+                answer=pop,
+            )
             return pop
 
         user_id = extract_user_id(text) or _infer_last_user(text)
         if not user_id:
-            debug_log("answer", user_id=None, intent="missing_user", question=text)
+            debug_log(
+                "answer",
+                route_channel="missing_user_id",
+                user_id=None,
+                intent="missing_user",
+                question_preview=_log_preview(text),
+            )
             return "请提供客户ID"
         user = get_user(user_id)
         if not user:
-            debug_log("answer", user_id=user_id, intent="missing_user_record", question=text)
+            debug_log(
+                "answer",
+                route_channel="missing_user_record",
+                user_id=user_id,
+                intent="missing_user_record",
+                question_preview=_log_preview(text),
+            )
             return "未查询到客户信息"
         _remember_last_user(user_id)
         return answer_user_question(text, user_id, user)
@@ -1488,6 +1571,11 @@ def run(inf: str) -> str:
         debug_log("error", question=text, error=repr(exc))
         return "暂时无法回答该问题"
     finally:
+        debug_log(
+            "run_complete",
+            elapsed_ms=int((time.time() - started) * 1000),
+            preview=_log_preview(text),
+        )
         _close_conn()
 
 
